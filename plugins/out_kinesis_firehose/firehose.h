@@ -91,6 +91,7 @@ struct flb_firehose {
     int custom_endpoint;
     int retry_requests;
     int compression;
+    int simple_aggregation;
 
     /* must be freed on shutdown if custom_endpoint is not set */
     char *endpoint;

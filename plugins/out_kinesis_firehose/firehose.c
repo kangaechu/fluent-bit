@@ -130,6 +130,12 @@ static int cb_firehose_init(struct flb_output_instance *ins,
         ctx->compression = ret;
     }
 
+    ctx->simple_aggregation = FLB_FALSE;
+    tmp = flb_output_get_property("simple_aggregation", ins);
+    if (tmp) {
+        ctx->simple_aggregation = flb_utils_bool(tmp);
+    }
+
     tmp = flb_output_get_property("log_key", ins);
     if (tmp) {
         ctx->log_key = tmp;
