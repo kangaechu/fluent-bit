@@ -157,7 +157,7 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
     size_t written = 0;
     int ret;
     size_t size;
-    size_t b64_len;
+    size_t b64_len = 0;
     struct firehose_event *event;
     char *tmp_buf_ptr;
     char *time_key_ptr;
@@ -305,7 +305,6 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
             flb_errno();
             return -1;
         }
-        written = b64_len;
     }
     else {
         /*
@@ -329,18 +328,18 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
     }
 
     tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_offset;
-    if ((buf->tmp_buf_size - buf->tmp_buf_offset) < written) {
+    if ((buf->tmp_buf_size - buf->tmp_buf_offset) < b64_len) {
         /* not enough space, send logs */
         return 1;
     }
 
     /* copy serialized json to tmp_buf */
-    memcpy(tmp_buf_ptr, buf->event_buf, written);
+    memcpy(tmp_buf_ptr, buf->event_buf, b64_len);
 
-    buf->tmp_buf_offset += written;
+    buf->tmp_buf_offset += b64_len;
     event = &buf->events[buf->event_index];
     event->json = tmp_buf_ptr;
-    event->len = written;
+    event->len = b64_len;
     event->timestamp.tv_sec = tms->tm.tv_sec;
     event->timestamp.tv_nsec = tms->tm.tv_nsec;
 
