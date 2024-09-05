@@ -154,20 +154,22 @@ static int end_put_payload(struct flb_firehose *ctx, struct flush *buf,
 static int process_event(struct flb_firehose *ctx, struct flush *buf,
                          const msgpack_object *obj, struct flb_time *tms)
 {
-    size_t written = 0;
+    size_t written = 0; // バッファに書き込んだバイト数
     int ret;
-    size_t size;
-    size_t b64_len = 0;
+    size_t size; // base64変換後の最大サイズ。base64の変換前にこのサイズでバッファを確保する
+    size_t b64_len = 0; // base64変換後のサイズ。flb_base64_encode() で設定される
     struct firehose_event *event;
-    char *tmp_buf_ptr;
+    char *tmp_buf_ptr; // イベントを一時的に保持するバッファのポインタ（バッファの先頭）
     char *time_key_ptr;
     struct tm time_stamp;
     struct tm *tmp;
-    size_t len;
-    size_t tmp_size;
+    size_t len; // time_keyで指定されたフォーマットに変換した文字列の長さ
+    size_t tmp_size; // 残りのバッファサイズ
+    size_t b64_cvt_size;
     void *compressed_tmp_buf;
     char *out_buf;
 
+    // 1. msgpack_objectをjsonに変換
     tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_offset;
     ret = flb_msgpack_to_json(tmp_buf_ptr,
                                   buf->tmp_buf_size - buf->tmp_buf_offset,
@@ -209,6 +211,7 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
         return 2;
     }
 
+    // 2. timestampをレコードに付与
     if (ctx->time_key) {
         /* append time_key to end of json string */
         tmp = gmtime_r(&tms->tm.tv_sec, &time_stamp);
@@ -249,6 +252,7 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
             time_key_ptr += strlen(ctx->time_key);
             memcpy(time_key_ptr, "\":\"", 3);
             time_key_ptr += 3;
+            // TODO: 以下で設定したtmp_sizeは279行目あたりで上書きされており、使われていない
             tmp_size = buf->tmp_buf_size - buf->tmp_buf_offset;
             tmp_size -= (time_key_ptr - tmp_buf_ptr);
 
@@ -281,6 +285,27 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
     memcpy(tmp_buf_ptr + written, "\n", 1);
     written++;
 
+    if (ctx->simple_aggregation) {
+        // writtenがMAX_EVENT_SIZEを超える場合、return 0
+        
+        memcpy(buf->simple_agg_buf + buf->simple_agg_buf_offset, tmp_buf_ptr, written);
+        buf->simple_agg_buf_offset += written;
+
+    
+        buf->tmp_buf_offset - buf->tmp_buf_last_flashed + written <= MAX_EVENT_SIZE) {
+        return 0;
+    }
+    
+    // 3. base64 + 圧縮
+    // simple_aggregationの場合は、複数レコードを圧縮したい
+    if (ctx->simple_aggregation) {
+        tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_last_flashed;
+        b64_cvt_size = buf->tmp_buf_offset - buf->tmp_buf_last_flashed;
+    }else {
+        tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_offset;
+        b64_cvt_size = written;
+    }
+
     if (ctx->compression == FLB_AWS_COMPRESS_NONE) {
         /*
          * check if event_buf is initialized and big enough
@@ -296,11 +321,9 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
                 return -1;
             }
         }
-
-        tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_offset;
         
         ret = flb_base64_encode((unsigned char *) buf->event_buf, size, &b64_len,
-                                (unsigned char *) tmp_buf_ptr, written);
+                                (unsigned char *) tmp_buf_ptr, b64_cvt_size);
         if (ret != 0) {
             flb_errno();
             return -1;
@@ -314,7 +337,7 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
         ret = flb_aws_compression_b64_truncate_compress(ctx->compression,
                                                        MAX_B64_EVENT_SIZE,
                                                        tmp_buf_ptr,
-                                                       written, &compressed_tmp_buf,
+                                                       b64_cvt_size, &compressed_tmp_buf,
                                                        &size); /* evaluate size */
         if (ret == -1) {
             flb_plg_error(ctx->ins, "Unable to compress record, discarding, "
@@ -324,7 +347,7 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
         flb_free(buf->event_buf);
         buf->event_buf = compressed_tmp_buf;
         compressed_tmp_buf = NULL;
-        written = size;
+        b64_len = size;
     }
 
     tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_offset;
@@ -350,6 +373,7 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
 static void reset_flush_buf(struct flb_firehose *ctx, struct flush *buf) {
     buf->event_index = 0;
     buf->tmp_buf_offset = 0;
+    buf->tmp_buf_last_flashed = 0;
     buf->data_size = PUT_RECORD_BATCH_HEADER_LEN + PUT_RECORD_BATCH_FOOTER_LEN;
     buf->data_size += strlen(ctx->delivery_stream);
 }
@@ -428,6 +452,7 @@ static int send_log_events(struct flb_firehose *ctx, struct flush *buf) {
 
 /*
  * Processes the msgpack object, sends the current batch if needed
+ 1レコードずつのデータが入ってくる
  */
 static int add_event(struct flb_firehose *ctx, struct flush *buf,
                      const msgpack_object *obj, struct flb_time *tms)
@@ -445,6 +470,7 @@ static int add_event(struct flb_firehose *ctx, struct flush *buf,
 retry_add_event:
     retry_add = FLB_FALSE;
     ret = process_event(ctx, buf, obj, tms);
+    // ここから下はエラーチェックなので見なくても良さそう
     if (ret < 0) {
         return -1;
     }
@@ -465,6 +491,7 @@ retry_add_event:
         return 0;
     }
 
+    // 
     event = &buf->events[buf->event_index];
     event_bytes = event->len + PUT_RECORD_BATCH_PER_RECORD_LEN;
 
@@ -503,6 +530,210 @@ send:
 
     return 0;
 }
+
+/* 
+* 以下の処理を実行
+* 1. objをJSONに変換
+* 2. JSONにtimestampを追加
+* 3. event_bufにコピー
+*/
+static int process_record(struct flb_kinesis *ctx, struct flush *buf,
+                         const msgpack_object *obj, struct flb_time *tms)
+{
+    size_t written = 0; // バッファに書き込んだバイト数
+    int ret; // 戻り値
+    size_t size;
+    size_t b64_len;
+    struct kinesis_event *event;
+    char *time_key_ptr; // 
+    struct tm time_stamp;
+    struct tm *tmp; // 
+    size_t len;
+    size_t tmp_size;
+    char *time_key_buf; // time_keyのフォーマット後の文字列を格納するバッファ
+    char *record_buf = flb_malloc(MAX_EVENT_SIZE * sizeof(char));
+    char *start_pos_ptr = record_buf;
+
+    // 1. objをJSONに変換
+   ret = flb_msgpack_to_json(record_buf, 0, obj);
+    if (ret <= 0) {
+        /*
+         * negative value means failure to write to buffer,
+         * which means we ran out of space, and must send the logs
+         *
+         * TODO: This could also incorrectly be triggered if the record
+         * is larger than MAX_EVENT_SIZE
+         */
+        return 1;
+    }
+    written = (size_t) ret;
+
+    /* Discard empty messages (written == 2 means '""') */
+    if (written <= 2) {
+        flb_plg_debug(ctx->ins, "Found empty log message, %s", ctx->stream_name);
+        return 2;
+    }
+
+    if (ctx->log_key) {
+        /*
+         * flb_msgpack_to_json will encase the value in quotes
+         * We don't want that for log_key, so we ignore the first
+         * and last character
+         */
+        written -= 2;
+        start_pos_ptr++; /* pass over the opening quote */
+    }
+
+    /* is (written + 1) because we still have to append newline */
+    if ((written + 1) >= MAX_EVENT_SIZE) {
+        flb_plg_warn(ctx->ins, "[size=%zu] Discarding record which is larger than "
+                     "max size allowed by Kinesis, %s", written + 1,
+                     ctx->stream_name);
+        return 2;
+    }
+
+    // 2. JSONにtimestampを追加
+    if (ctx->time_key) {
+        /* append time_key to end of json string */
+        tmp = gmtime_r(&tms->tm.tv_sec, &time_stamp);
+        if (!tmp) {
+            flb_plg_error(ctx->ins, "Could not create time stamp for %lu unix "
+                         "seconds, discarding record, %s", tms->tm.tv_sec,
+                         ctx->stream_name);
+            return 2;
+        }
+
+        /* format time output and return the length */
+        len = flb_aws_strftime_precision(&time_key_buf, ctx->time_key_format, tms);
+
+        /* how much space do we have left */
+        tmp_size = (buf->tmp_buf_size - buf->tmp_buf_offset) - written;
+        if (len > tmp_size) {
+            /* not enough space - tell caller to retry */
+            flb_free(time_key_buf);
+            return 1;
+        }
+
+        if (len == 0) {
+            /*
+             * when the length of time_key_buf is not enough for time_key_format,
+             * time_key will not be added to record.
+             */
+            flb_plg_error(ctx->ins, "Failed to add time_key %s to record, %s",
+                          ctx->time_key, ctx->stream_name);
+            flb_free(time_key_buf);
+        }
+        else {
+            if ((written + 6 + strlen(ctx->time_key) + len) >= MAX_EVENT_SIZE) {
+                flb_plg_warn(ctx->ins, "[size=%zu] Discarding record which is larger than "
+                "max size allowed by Kinesis, %s", written + 1,
+                ctx->stream_name);
+                return 2;
+            }
+            time_key_ptr = start_pos_ptr + written - 1;
+            memcpy(time_key_ptr, ",", 1);
+            time_key_ptr++;
+            memcpy(time_key_ptr, "\"", 1);
+            time_key_ptr++;
+            memcpy(time_key_ptr, ctx->time_key, strlen(ctx->time_key));
+            time_key_ptr += strlen(ctx->time_key);
+            memcpy(time_key_ptr, "\":\"", 3);
+            time_key_ptr += 3;
+
+            /* merge time_key_buf to time_key_ptr */
+            memcpy(time_key_ptr, time_key_buf, len);
+            flb_free(time_key_buf);
+            time_key_ptr += len;
+            memcpy(time_key_ptr, "\"}", 2);
+            time_key_ptr += 2;
+            written = (time_key_ptr - start_pos_ptr);
+        }
+    }
+
+    /* is (written + 1) because we still have to append newline */
+    if ((written + 1) >= MAX_EVENT_SIZE) {
+        flb_plg_warn(ctx->ins, "[size=%zu] Discarding record which is larger than "
+                     "max size allowed by Kinesis, %s", written + 1,
+                     ctx->stream_name);
+        return 2;
+    }
+    memcpy(tmp_buf_ptr + written, "\n", 1);
+    written++;
+
+    // 3. event_bufにコピー
+    memcpy(ctx->event_buf + ctx->event_buf_offset, start_pos_ptr, written);
+    ctx->event_buf_offset += written;
+}
+
+static int process_event2(struct flb_kinesis *ctx, struct flush *buf,
+                         const msgpack_object *obj, struct flb_time *tms)
+{
+
+
+    // 3. base64 + 圧縮
+    if (ctx->compression == FLB_AWS_COMPRESS_NONE) {
+        /*
+         * check if event_buf is initialized and big enough
+         * Base64 encoding will increase size by ~4/3
+         */
+        size = (written * 1.5) + 4;
+        if (buf->event_buf == NULL || buf->event_buf_size < size) {
+            flb_free(buf->event_buf);
+            buf->event_buf = flb_malloc(size);
+            buf->event_buf_size = size;
+            if (buf->event_buf == NULL) {
+                flb_errno();
+                return -1;
+            }
+        }
+        
+        ret = flb_base64_encode((unsigned char *) buf->event_buf, size, &b64_len,
+                                (unsigned char *) tmp_buf_ptr, b64_cvt_size);
+        if (ret != 0) {
+            flb_errno();
+            return -1;
+        }
+    }
+    else {
+        /*
+         * compress event, truncating input if needed
+         * replace event buffer with compressed buffer
+         */
+        ret = flb_aws_compression_b64_truncate_compress(ctx->compression,
+                                                       MAX_B64_EVENT_SIZE,
+                                                       tmp_buf_ptr,
+                                                       b64_cvt_size, &compressed_tmp_buf,
+                                                       &size); /* evaluate size */
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "Unable to compress record, discarding, "
+                                    "%s", ctx->delivery_stream);
+            return 2;
+        }
+        flb_free(buf->event_buf);
+        buf->event_buf = compressed_tmp_buf;
+        compressed_tmp_buf = NULL;
+        b64_len = size;
+    }
+
+    tmp_buf_ptr = buf->tmp_buf + buf->tmp_buf_offset;
+    if ((buf->tmp_buf_size - buf->tmp_buf_offset) < b64_len) {
+        /* not enough space, send logs */
+        return 1;
+    }
+
+    /* copy serialized json to tmp_buf */
+    memcpy(tmp_buf_ptr, buf->event_buf, b64_len);
+
+    buf->tmp_buf_offset += b64_len;
+    event = &buf->events[buf->event_index];
+    event->json = tmp_buf_ptr;
+    event->len = b64_len;
+    event->timestamp.tv_sec = tms->tm.tv_sec;
+    event->timestamp.tv_nsec = tms->tm.tv_nsec;
+
+    return 0;
+}
+
 
 /*
  * Main routine- processes msgpack and sends in batches
@@ -590,6 +821,7 @@ int process_and_send_records(struct flb_firehose *ctx, struct flush *buf,
             continue;
         }
 
+        // nextがないので最後の処理が必要
         ret = add_event(ctx, buf, &map, &log_event.timestamp);
         if (ret < 0 ) {
             goto error;
@@ -950,6 +1182,7 @@ void flush_destroy(struct flush *buf)
 {
     if (buf) {
         flb_free(buf->tmp_buf);
+        flb_free(buf->event_buf);
         flb_free(buf->out_buf);
         flb_free(buf->events);
         flb_free(buf->event_buf);
