@@ -32,15 +32,20 @@
 /* buffers used for each flush */
 struct flush {
     /* temporary buffer for storing the serialized event messages */
-    char *tmp_buf;
+    char *cur_records_buf;
     size_t tmp_buf_size;
-    /* current index of tmp_buf */
+    /* current index of cur_records_buf */
     size_t tmp_buf_offset;
+
+    /* buffer for a event */
+    char *event_buf;
+    /* current position of event_buf */
+    size_t event_buf_offset;  
 
     /* projected final size of the payload for this flush */
     size_t data_size;
 
-    /* log records- each of these has a pointer to their message in tmp_buf */
+    /* log records- each of these has a pointer to their message in cur_records_buf */
     struct firehose_event *events;
     int events_capacity;
     /* current event */

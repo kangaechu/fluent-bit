@@ -220,7 +220,7 @@ static int process_event(struct flb_kinesis *ctx, struct flush *buf,
     size_t size;
     size_t b64_len;
     struct kinesis_event *event;
-    char *tmp_buf_ptr;
+    char *tmp_buf_ptr; // tmp_buf
     char *time_key_ptr;
     struct tm time_stamp;
     struct tm *tmp;
@@ -370,6 +370,7 @@ static int process_event(struct flb_kinesis *ctx, struct flush *buf,
     }
 
     /* copy serialized json to tmp_buf */
+    // BASE64したデータをtmp_bufにコピーしている
     memcpy(tmp_buf_ptr, buf->event_buf, written);
 
     buf->tmp_buf_offset += written;

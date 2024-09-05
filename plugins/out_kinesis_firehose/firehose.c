@@ -315,6 +315,14 @@ struct flush *new_flush_buffer()
     }
     buf->tmp_buf_size = PUT_RECORD_BATCH_PAYLOAD_SIZE;
 
+    buf->event_buf = flb_malloc(sizeof(char) * PUT_RECORD_BATCH_PAYLOAD_SIZE);
+    if (!buf->event_buf) {
+        flb_errno();
+        flush_destroy(buf);
+        return NULL;
+    }
+    buf->tmp_buf_size = PUT_RECORD_BATCH_PAYLOAD_SIZE;
+
     buf->events = flb_malloc(sizeof(struct firehose_event) * MAX_EVENTS_PER_PUT);
     if (!buf->events) {
         flb_errno();
@@ -326,15 +334,15 @@ struct flush *new_flush_buffer()
     return buf;
 }
 
-static void cb_firehose_flush(struct flb_event_chunk *event_chunk,
-                              struct flb_output_flush *out_flush,
-                              struct flb_input_instance *i_ins,
-                              void *out_context,
-                              struct flb_config *config)
+static void cb_firehose_flush(struct flb_event_chunk *event_chunk, //レコードのタイプ（ログ、メトリクス）、タグ、msgpackバッファ、サイズ、シリアル化されたmsgpackイベントのヒント
+                              struct flb_output_flush *out_flush, // 使ってない
+                              struct flb_input_instance *i_ins, // 使ってない
+                              void *out_context, // Firehoseに接続するためのパラメータなど
+                              struct flb_config *config) // 使ってない
 {
     struct flb_firehose *ctx = out_context;
     int ret;
-    struct flush *buf;
+    struct flush *buf; // バッファの構造体 simple_aggregationを実装するならこれもいるかも
     (void) i_ins;
     (void) config;
 
@@ -490,6 +498,17 @@ static struct flb_config_map config_map[] = {
      "AWS Profile name. AWS Profiles can be configured with AWS CLI and are usually stored in "
      "$HOME/.aws/ directory."
     },
+
+    {
+     FLB_SIMPLE_AGGREGATION, "simple_aggregation", "false",
+     0, FLB_FALSE, offsetof(struct flb_firehose, retry_requests),
+     "Immediately retry failed requests to AWS services once. This option "
+     "does not affect the normal Fluent Bit retry mechanism with backoff. "
+     "Instead, it enables an immediate retry with no delay for networking "
+     "errors, which may help improve throughput when there are transient/random "
+     "networking issues."
+    },
+
     /* EOF */
     {0}
 };
