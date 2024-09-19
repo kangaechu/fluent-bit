@@ -37,6 +37,11 @@ struct flush {
     /* current index of cur_records_buf */
     size_t tmp_buf_offset;
 
+    /* buffer for a record */
+    char *record_buf;
+    /* current position of record_buf */
+    size_t record_buf_offset;  
+
     /* buffer for a event */
     char *event_buf;
     /* current position of event_buf */

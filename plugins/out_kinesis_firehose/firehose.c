@@ -315,13 +315,19 @@ struct flush *new_flush_buffer()
     }
     buf->tmp_buf_size = PUT_RECORD_BATCH_PAYLOAD_SIZE;
 
+    buf->record_buf = flb_malloc(sizeof(char) * PUT_RECORD_BATCH_PAYLOAD_SIZE);
+    if (!buf->record_buf) {
+        flb_errno();
+        flush_destroy(buf);
+        return NULL;
+    }
+
     buf->event_buf = flb_malloc(sizeof(char) * PUT_RECORD_BATCH_PAYLOAD_SIZE);
     if (!buf->event_buf) {
         flb_errno();
         flush_destroy(buf);
         return NULL;
     }
-    buf->tmp_buf_size = PUT_RECORD_BATCH_PAYLOAD_SIZE;
 
     buf->events = flb_malloc(sizeof(struct firehose_event) * MAX_EVENTS_PER_PUT);
     if (!buf->events) {

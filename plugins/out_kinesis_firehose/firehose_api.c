@@ -292,8 +292,9 @@ static int process_event(struct flb_firehose *ctx, struct flush *buf,
         buf->simple_agg_buf_offset += written;
 
     
-        buf->tmp_buf_offset - buf->tmp_buf_last_flashed + written <= MAX_EVENT_SIZE) {
-        return 0;
+        if (buf->tmp_buf_offset - buf->tmp_buf_last_flashed + written <= MAX_EVENT_SIZE) {
+            return 0;
+        }
     }
     
     // 3. base64 + 圧縮
@@ -454,6 +455,85 @@ static int send_log_events(struct flb_firehose *ctx, struct flush *buf) {
  * Processes the msgpack object, sends the current batch if needed
  1レコードずつのデータが入ってくる
  */
+static int add_event2(struct flb_firehose *ctx, struct flush *buf,
+                     const msgpack_object *obj, struct flb_time *tms)
+{
+    int ret;
+    struct firehose_event *event;
+    int retry_add = FLB_FALSE;
+    size_t event_bytes = 0;
+
+    if (buf->event_index == 0) {
+        /* init */
+        reset_flush_buf(ctx, buf);
+    }
+
+retry_add_event:
+    retry_add = FLB_FALSE;
+    ret = process_record(ctx, buf, obj, tms);
+    // ここから下はエラーチェックなので見なくても良さそう
+    if (ret < 0) {
+        return -1;
+    }
+    else if (ret == 1) {
+        if (buf->event_index <= 0) {
+            /* somehow the record was larger than our entire request buffer */
+            flb_plg_warn(ctx->ins, "Discarding massive log record, %s",
+                         ctx->delivery_stream);
+            return 0; /* discard this record and return to caller */
+        }
+        /* send logs and then retry the add */
+        retry_add = FLB_TRUE;
+        goto send;
+    } else if (ret == 2) {
+        /* discard this record and return to caller */
+        flb_plg_warn(ctx->ins, "Discarding large or unprocessable record, %s",
+                     ctx->delivery_stream);
+        return 0;
+    }
+
+    // ctx.simple_aggregationがtrueの場合、ここで処理を分ける
+
+    // 
+    event = &buf->events[buf->event_index];
+    event_bytes = event->len + PUT_RECORD_BATCH_PER_RECORD_LEN;
+
+    if ((buf->data_size + event_bytes) > PUT_RECORD_BATCH_PAYLOAD_SIZE) {
+        if (buf->event_index <= 0) {
+            /* somehow the record was larger than our entire request buffer */
+            flb_plg_warn(ctx->ins, "[size=%zu] Discarding massive log record, %s",
+                         event_bytes, ctx->delivery_stream);
+            return 0; /* discard this record and return to caller */
+        }
+        /* do not send this event */
+        retry_add = FLB_TRUE;
+        goto send;
+    }
+
+    /* send is not needed yet, return to caller */
+    buf->data_size += event_bytes;
+    buf->event_index++;
+
+    if (buf->event_index == MAX_EVENTS_PER_PUT) {
+        goto send;
+    }
+
+    return 0;
+
+send:
+    ret = send_log_events(ctx, buf);
+    reset_flush_buf(ctx, buf);
+    if (ret < 0) {
+        return -1;
+    }
+
+    if (retry_add == FLB_TRUE) {
+        goto retry_add_event;
+    }
+
+    return 0;
+}
+
 static int add_event(struct flb_firehose *ctx, struct flush *buf,
                      const msgpack_object *obj, struct flb_time *tms)
 {
@@ -536,7 +616,14 @@ send:
 * 1. objをJSONに変換
 * 2. JSONにtimestampを追加
 * 3. event_bufにコピー
+* 戻り値は以下の通り
+ * -1 = failure, record not added (存在しない)
+ * 0 = success, record added
+ * 1 = we ran out of space, send and retry
+ * 2 = record could not be processed, discard it
+
 */
+// TODO: エラーレベルとエラーメッセージをそろえる
 static int process_record(struct flb_kinesis *ctx, struct flush *buf,
                          const msgpack_object *obj, struct flb_time *tms)
 {
@@ -557,14 +644,8 @@ static int process_record(struct flb_kinesis *ctx, struct flush *buf,
     // 1. objをJSONに変換
    ret = flb_msgpack_to_json(record_buf, 0, obj);
     if (ret <= 0) {
-        /*
-         * negative value means failure to write to buffer,
-         * which means we ran out of space, and must send the logs
-         *
-         * TODO: This could also incorrectly be triggered if the record
-         * is larger than MAX_EVENT_SIZE
-         */
-        return 1;
+        flb_plg_error(ctx->ins, "Failed to convert msgpack to JSON, %s, return code: %d", ctx->stream_name, ret);
+        return 2;
     }
     written = (size_t) ret;
 
@@ -586,7 +667,7 @@ static int process_record(struct flb_kinesis *ctx, struct flush *buf,
 
     /* is (written + 1) because we still have to append newline */
     if ((written + 1) >= MAX_EVENT_SIZE) {
-        flb_plg_warn(ctx->ins, "[size=%zu] Discarding record which is larger than "
+        flb_plg_error(ctx->ins, "[size=%zu] Discarding record which is larger than "
                      "max size allowed by Kinesis, %s", written + 1,
                      ctx->stream_name);
         return 2;
@@ -665,11 +746,23 @@ static int process_record(struct flb_kinesis *ctx, struct flush *buf,
     ctx->event_buf_offset += written;
 }
 
+/*
+ * process_event2 - Processes an event by either base64 encoding or compressing it.
+ * 
+ * @ctx: Pointer to the Kinesis context structure.
+ * @buf: Pointer to the flush buffer structure.
+ * @obj: Pointer to the msgpack object.
+ * @tms: Pointer to the flb_time structure.
+ * 
+ * This function processes an event by checking the compression setting in the context.
+ * If no compression is required, it base64 encodes the event and ensures the buffer is
+ * large enough to hold the encoded data. If compression is required, it compresses the
+ * event, truncating the input if needed, and replaces the event buffer with the compressed
+ * buffer. The function returns 0 on success, -1 on error, and 2 if compression fails.
+ */
 static int process_event2(struct flb_kinesis *ctx, struct flush *buf,
                          const msgpack_object *obj, struct flb_time *tms)
 {
-
-
     // 3. base64 + 圧縮
     if (ctx->compression == FLB_AWS_COMPRESS_NONE) {
         /*
