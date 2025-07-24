@@ -28,6 +28,16 @@
 #include <fluent-bit/flb_signv4.h>
 
 #define DEFAULT_TIME_KEY_FORMAT "%Y-%m-%dT%H:%M:%S"
+#define DEFAULT_MAX_AGGREGATED_RECORD_SIZE 768000  /* 750KB - safe for base64 encoding within 1MB limit */
+
+/* aggregated record for simple_aggregation feature */
+struct aggregated_record {
+    char *data;              /* aggregated JSON data */
+    size_t size;             /* current size */
+    size_t capacity;         /* buffer capacity */
+    int log_count;           /* number of log records contained */
+    struct timespec first_timestamp;  /* timestamp of first record */
+};
 
 /* buffers used for each flush */
 struct flush {
@@ -56,6 +66,9 @@ struct flush {
 
     int records_sent;
     int records_processed;
+
+    /* simple aggregation support */
+    struct aggregated_record current_aggregated;
 };
 
 struct firehose_event {
@@ -91,6 +104,7 @@ struct flb_firehose {
     int custom_endpoint;
     int retry_requests;
     int compression;
+    int simple_aggregation;
 
     /* must be freed on shutdown if custom_endpoint is not set */
     char *endpoint;

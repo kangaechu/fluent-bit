@@ -143,6 +143,12 @@ static int cb_firehose_init(struct flb_output_instance *ins,
         goto error;
     }
 
+    /* Log simple aggregation settings */
+    if (ctx->simple_aggregation) {
+        flb_plg_info(ctx->ins, "Simple aggregation enabled with max record size: %d bytes",
+                     DEFAULT_MAX_AGGREGATED_RECORD_SIZE);
+    }
+
     tmp = flb_output_get_property("role_arn", ins);
     if (tmp) {
         ctx->role_arn = tmp;
@@ -317,6 +323,12 @@ struct flush *new_flush_buffer()
     }
     buf->events_capacity = MAX_EVENTS_PER_PUT;
 
+    /* Initialize aggregated record */
+    buf->current_aggregated.data = NULL;
+    buf->current_aggregated.size = 0;
+    buf->current_aggregated.capacity = 0;
+    buf->current_aggregated.log_count = 0;
+
     return buf;
 }
 
@@ -483,6 +495,12 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_firehose, profile),
      "AWS Profile name. AWS Profiles can be configured with AWS CLI and are usually stored in "
      "$HOME/.aws/ directory."
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "simple_aggregation", "false",
+     0, FLB_TRUE, offsetof(struct flb_firehose, simple_aggregation),
+     "Enable simple aggregation to combine multiple log records into a single Firehose record"
     },
     /* EOF */
     {0}

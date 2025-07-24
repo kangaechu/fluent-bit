@@ -42,4 +42,13 @@ int process_and_send_records(struct flb_firehose *ctx, struct flush *buf,
 int put_record_batch(struct flb_firehose *ctx, struct flush *buf,
                      size_t payload_size, int num_records);
 
+/* Simple aggregation functions */
+void cleanup_aggregated_record(struct aggregated_record *agg);
+int init_aggregated_record(struct flb_firehose *ctx, struct flush *buf, 
+                          struct flb_time *tms);
+int process_aggregated_event(struct flb_firehose *ctx, struct flush *buf,
+                            const char *json_data, size_t json_len,
+                            struct flb_time *tms);
+int finalize_aggregated_record(struct flb_firehose *ctx, struct flush *buf);
+
 #endif

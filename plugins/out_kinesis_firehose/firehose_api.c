@@ -573,7 +573,23 @@ int process_and_send_records(struct flb_firehose *ctx, struct flush *buf,
                     if (strncmp(ctx->log_key, key_str, key_str_size) == 0) {
                         found = FLB_TRUE;
                         val = (kv+j)->val;
-                        ret = add_event(ctx, buf, &val, &log_event.timestamp);
+                        
+                        if (ctx->simple_aggregation) {
+                            /* Convert to JSON and use aggregation */
+                            char *json_buf = buf->tmp_buf + buf->tmp_buf_offset;
+                            size_t available = buf->tmp_buf_size - buf->tmp_buf_offset;
+                            
+                            ret = flb_msgpack_to_json(json_buf, available, &val);
+                            if (ret > 0) {
+                                /* Remove quotes for log_key mode */
+                                if (ret > 2) {
+                                    ret = process_aggregated_event(ctx, buf, json_buf + 1, ret - 2, &log_event.timestamp);
+                                }
+                            }
+                        } else {
+                            ret = add_event(ctx, buf, &val, &log_event.timestamp);
+                        }
+                        
                         if (ret < 0 ) {
                             goto error;
                         }
@@ -591,13 +607,33 @@ int process_and_send_records(struct flb_firehose *ctx, struct flush *buf,
             continue;
         }
 
-        ret = add_event(ctx, buf, &map, &log_event.timestamp);
+        if (ctx->simple_aggregation) {
+            /* Convert to JSON and use aggregation */
+            char *json_buf = buf->tmp_buf + buf->tmp_buf_offset;
+            size_t available = buf->tmp_buf_size - buf->tmp_buf_offset;
+            
+            ret = flb_msgpack_to_json(json_buf, available, &map);
+            if (ret > 0) {
+                ret = process_aggregated_event(ctx, buf, json_buf, ret, &log_event.timestamp);
+            }
+        } else {
+            ret = add_event(ctx, buf, &map, &log_event.timestamp);
+        }
+        
         if (ret < 0 ) {
             goto error;
         }
         i++;
     }
     flb_log_event_decoder_destroy(&log_decoder);
+
+    /* Finalize any remaining aggregated record */
+    if (ctx->simple_aggregation) {
+        ret = finalize_aggregated_record(ctx, buf);
+        if (ret < 0) {
+            return -1;
+        }
+    }
 
     /* send any remaining events */
     ret = send_log_events(ctx, buf);
@@ -950,10 +986,156 @@ int put_record_batch(struct flb_firehose *ctx, struct flush *buf,
 void flush_destroy(struct flush *buf)
 {
     if (buf) {
+        cleanup_aggregated_record(&buf->current_aggregated);
         flb_free(buf->tmp_buf);
         flb_free(buf->out_buf);
         flb_free(buf->events);
         flb_free(buf->event_buf);
         flb_free(buf);
     }
+}
+
+/* Simple aggregation implementation */
+
+void cleanup_aggregated_record(struct aggregated_record *agg)
+{
+    if (agg && agg->data) {
+        flb_free(agg->data);
+        agg->data = NULL;
+        agg->size = 0;
+        agg->capacity = 0;
+        agg->log_count = 0;
+    }
+}
+
+int init_aggregated_record(struct flb_firehose *ctx, struct flush *buf, 
+                          struct flb_time *tms)
+{
+    struct aggregated_record *agg = &buf->current_aggregated;
+    
+    /* Clean up existing record if any */
+    cleanup_aggregated_record(agg);
+    
+    /* Allocate initial buffer */
+    agg->capacity = 65536; /* Start with 64KB */
+    agg->data = flb_malloc(agg->capacity);
+    if (!agg->data) {
+        flb_errno();
+        return -1;
+    }
+    
+    agg->size = 0;
+    agg->log_count = 0;
+    agg->first_timestamp = tms->tm;
+    
+    return 0;
+}
+
+int process_aggregated_event(struct flb_firehose *ctx, struct flush *buf,
+                            const char *json_data, size_t json_len,
+                            struct flb_time *tms)
+{
+    struct aggregated_record *agg = &buf->current_aggregated;
+    size_t needed_size = json_len + (agg->size > 0 ? 1 : 0); /* +1 for newline if not first */
+    int ret;
+    
+    /* Initialize if first record or finalize if size limit exceeded */
+    if (agg->data == NULL || (agg->size + needed_size) > DEFAULT_MAX_AGGREGATED_RECORD_SIZE) {
+        /* Finalize current aggregated record if it has data */
+        if (agg->size > 0) {
+            ret = finalize_aggregated_record(ctx, buf);
+            if (ret < 0) {
+                return ret;
+            }
+        }
+        
+        /* Initialize new aggregated record */
+        ret = init_aggregated_record(ctx, buf, tms);
+        if (ret < 0) {
+            return ret;
+        }
+        needed_size = json_len; /* No newline needed for first record */
+    }
+    
+    /* Expand buffer if needed */
+    if (agg->size + needed_size > agg->capacity) {
+        size_t new_capacity = agg->capacity;
+        while (new_capacity < agg->size + needed_size) {
+            new_capacity *= 2;
+        }
+        
+        char *new_data = flb_realloc(agg->data, new_capacity);
+        if (!new_data) {
+            flb_errno();
+            return -1;
+        }
+        
+        agg->data = new_data;
+        agg->capacity = new_capacity;
+    }
+    
+    /* Add newline separator if not the first record */
+    if (agg->size > 0) {
+        agg->data[agg->size] = '\n';
+        agg->size++;
+    }
+    
+    /* Add JSON data */
+    memcpy(agg->data + agg->size, json_data, json_len);
+    agg->size += json_len;
+    agg->log_count++;
+    
+    return 0;
+}
+
+int finalize_aggregated_record(struct flb_firehose *ctx, struct flush *buf)
+{
+    struct aggregated_record *agg = &buf->current_aggregated;
+    struct firehose_event *event;
+    size_t b64_len;
+    int ret;
+    
+    if (agg->size == 0) {
+        return 0; /* Nothing to finalize */
+    }
+    
+    /* Check if we have space for another event */
+    if (buf->event_index >= buf->events_capacity) {
+        flb_plg_error(ctx->ins, "No space for aggregated record in events buffer");
+        return -1;
+    }
+    
+    /* Base64 encode the aggregated data */
+    size_t b64_capacity = (agg->size * 1.5) + 4;
+    char *b64_data = flb_malloc(b64_capacity);
+    if (!b64_data) {
+        flb_errno();
+        return -1;
+    }
+    
+    ret = flb_base64_encode((unsigned char *)b64_data, b64_capacity, &b64_len,
+                           (unsigned char *)agg->data, agg->size);
+    if (ret != 0) {
+        flb_errno();
+        flb_free(b64_data);
+        return -1;
+    }
+    
+    /* Store as event */
+    event = &buf->events[buf->event_index];
+    event->json = b64_data;
+    event->len = b64_len;
+    event->timestamp = agg->first_timestamp;
+    
+    buf->event_index++;
+    buf->data_size += b64_len + PUT_RECORD_BATCH_PER_RECORD_LEN;
+    
+    flb_plg_debug(ctx->ins, "Finalized aggregated record: %d log records, %zu bytes -> %zu bytes (base64)",
+                  agg->log_count, agg->size, b64_len);
+    
+    /* Reset aggregated record */
+    agg->size = 0;
+    agg->log_count = 0;
+    
+    return 0;
 }
